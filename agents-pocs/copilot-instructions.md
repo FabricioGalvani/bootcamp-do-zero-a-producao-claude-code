@@ -99,6 +99,94 @@ def normalizar_colunas(df: pd.DataFrame, colunas: list[str]) -> pd.DataFrame:
 - Não gerar queries SQL concatenando strings — use parâmetros ou SQLAlchemy Core.
 - Não criar funções gigantes; quebrar em unidades testáveis.
 
+## Logging
+
+Logs devem ajudar a entender o que aconteceu em produção sem poluir a saída. Regra geral: **se você precisaria dessa linha às 3h da manhã para debugar, logue. Caso contrário, não.**
+
+### Diretrizes
+
+- **Use sempre a função utilitária de logging do projeto** (responsável por inicializar e configurar o `logging`). Nunca chame `logging.basicConfig` nem crie `StreamHandler` manualmente no meio do código.
+- O logger deve ser obtido dessa função utilitária e atribuído a:
+  - `self.logger` quando estiver dentro de uma classe de ETL.
+  - Uma variável de módulo/função chamada `logger` em funções avulsas.
+- Nunca use `print` para logar.
+- **Um log por evento significativo**, não um log por linha de código.
+- **Níveis corretos:**
+  - `DEBUG`: detalhes internos úteis só durante investigação (valores intermediários, queries montadas).
+  - `INFO`: marcos do pipeline (início/fim de etapa, quantidade de registros processados, arquivo gerado).
+  - `WARNING`: algo inesperado mas recuperável (registro descartado por schema inválido, retry feito).
+  - `ERROR`: falha que impede a operação atual (não conseguiu carregar tabela, API retornou 500).
+  - `CRITICAL`: pipeline inteiro inviabilizado (banco fora do ar, credencial ausente).
+- **Inclua contexto útil** na mensagem: nome da etapa, quantidade de linhas, identificador do lote, tempo decorrido. Sem contexto, o log é inútil.
+- **Nunca logue dados sensíveis**: senhas, tokens, PII, conteúdo bruto de registros. Log apenas IDs ou contagens.
+- Prefira **mensagens parametrizadas** (`logger.info("Processados %d registros em %.2fs", n, elapsed)`) em vez de f-strings — evita custo de formatação quando o nível está desligado.
+- Em loops grandes, **não logue a cada iteração**. Logue no início, no fim e em batches (ex.: a cada 10.000 registros).
+- **PySpark: nunca chame `df.count()` (ou qualquer ação que force execução, como `.collect()`, `.show()`) dentro de logs em nível `INFO`** — isso dispara um job inteiro só para gerar a mensagem e degrada o pipeline. Contagens de DataFrames Spark só são aceitáveis em `DEBUG`, e ainda assim com parcimônia. Para marcos de pipeline, prefira logar o **nome da etapa, parâmetros e tempo decorrido**, não o volume.
+
+### Exemplo — função avulsa
+
+```python
+import time
+
+from meu_projeto.logging_utils import get_logger  # função utilitária do projeto
+
+logger = get_logger(__name__)
+
+
+def carregar_lote(lote_id: str, registros: list[dict]) -> int:
+    """Carrega um lote de registros no destino e retorna a contagem inserida."""
+    inicio = time.perf_counter()
+    logger.info("Iniciando carga do lote %s (%d registros)", lote_id, len(registros))
+
+    try:
+        inseridos = _inserir(registros)
+    except Exception:
+        logger.exception("Falha ao carregar lote %s", lote_id)  # já inclui traceback
+        raise
+
+    elapsed = time.perf_counter() - inicio
+    logger.info("Lote %s carregado em %.2fs", lote_id, elapsed)
+    return inseridos
+```
+
+### Exemplo — classe de ETL (PySpark)
+
+```python
+import time
+
+from pyspark.sql import DataFrame
+
+from meu_projeto.logging_utils import get_logger
+
+
+class MeuETL:
+    def __init__(self, origem: str, destino: str) -> None:
+        self.origem = origem
+        self.destino = destino
+        self.logger = get_logger(self.__class__.__name__)
+
+    def transformar(self, df: DataFrame) -> DataFrame:
+        self.logger.info("Iniciando transformação (origem=%s)", self.origem)
+        inicio = time.perf_counter()
+
+        df_out = df.filter("ativo = true").dropDuplicates(["id"])
+
+        # df_out.count() aqui seria uma ação cara — evite em INFO.
+        self.logger.debug("Schema pós-transformação: %s", df_out.schema.simpleString())
+
+        self.logger.info("Transformação concluída em %.2fs", time.perf_counter() - inicio)
+        return df_out
+```
+
+### O que evitar
+
+- `logger.info("entrou na função X")` / `logger.info("saiu da função X")` — ruído puro.
+- Logar o mesmo evento em vários níveis da call stack.
+- Usar `logger.error()` + `raise` no mesmo lugar com a exceção crua — use `logger.exception()` que já anexa o traceback.
+- Mensagens vagas como `"erro ao processar"` sem identificador, contagem ou causa.
+- Chamar `df.count()`, `df.collect()` ou `df.show()` dentro de mensagens de log em `INFO`/`WARNING` em pipelines PySpark — força execução e degrada o desempenho do ETL.
+- Reconfigurar o `logging` dentro de módulos (ex.: `logging.basicConfig(...)`) — a configuração é responsabilidade exclusiva da função utilitária do projeto.
+
 ## Testes
 
 - Todo novo módulo em `src/` deve ter teste correspondente em `tests/`.
